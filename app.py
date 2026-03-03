@@ -1,8 +1,9 @@
 import os
 import shutil
 from uuid import uuid4
-from fastapi import FastAPI, UploadFile, HTTPException
+from fastapi import FastAPI, UploadFile, HTTPException, Body
 from markitdown import MarkItDown
+
 
 app = FastAPI(title="MarkItDown API - Conversão para Markdown")
 
@@ -41,3 +42,28 @@ async def convert_to_markdown(file: UploadFile):
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
+
+
+@app.post("/youtube-transcription")
+async def youtube_transcription(data: dict = Body(...)):
+    """
+    Transcreve um vídeo do YouTube para Markdown usando MarkItDown.
+    Envie no body: {"url": "https://www.youtube.com/watch?v=VIDEO_ID"}
+    """
+    url = data.get("url")
+    if not url or not isinstance(url, str) or "youtube.com" not in url and "youtu.be" not in url:
+        raise HTTPException(status_code=400, detail="Envie uma URL válida do YouTube no campo 'url'")
+
+    try:
+        # MarkItDown suporta URL diretamente!
+        result = md.convert(url)
+        markdown_content = result.text_content
+
+        return {
+            "markdown": markdown_content,
+            "source_url": url,
+            "note": "Transcrição automática via MarkItDown (pode incluir timestamps se disponíveis)"
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao transcrever YouTube: {str(e)}")
