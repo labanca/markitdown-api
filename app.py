@@ -44,26 +44,58 @@ async def health_check():
     return {"status": "healthy"}
 
 
+from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled, CouldNotRetrieveTranscript
+from urllib.parse import urlparse, parse_qs
+from fastapi import Body, HTTPException
+
+def extract_video_id(url: str) -> str:
+    """Extrai video_id de URL YouTube (inclui shorts, youtu.be, etc.)"""
+    parsed = urlparse(url)
+    if parsed.hostname == 'youtu.be':
+        return parsed.path[1:]
+    if parsed.hostname in ('www.youtube.com', 'youtube.com'):
+        if parsed.path == '/watch':
+            params = parse_qs(parsed.query)
+            return params['v'][0]
+        if parsed.path[:7] == '/embed/':
+            return parsed.path.split('/')[2]
+        if parsed.path[:3] == '/v/':
+            return parsed.path.split('/')[2]
+        if parsed.path[:9] == '/shorts/':
+            return parsed.path.split('/')[2]
+    raise ValueError("URL inválida do YouTube")
+
 @app.post("/youtube-transcription")
 async def youtube_transcription(data: dict = Body(...)):
-    """
-    Transcreve um vídeo do YouTube para Markdown usando MarkItDown.
-    Envie no body: {"url": "https://www.youtube.com/watch?v=VIDEO_ID"}
-    """
     url = data.get("url")
-    if not url or not isinstance(url, str) or "youtube.com" not in url and "youtu.be" not in url:
-        raise HTTPException(status_code=400, detail="Envie uma URL válida do YouTube no campo 'url'")
+    if not url:
+        raise HTTPException(400, "Envie 'url' no body JSON")
 
     try:
-        # MarkItDown suporta URL diretamente!
-        result = md.convert(url)
-        markdown_content = result.text_content
+        video_id = extract_video_id(url)
+        # Tenta transcrições em pt-BR primeiro, fallback para en ou auto
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        try:
+            transcript = transcript_list.find_transcript(['pt', 'pt-BR'])
+        except NoTranscriptFound:
+            try:
+                transcript = transcript_list.find_transcript(['en'])
+            except NoTranscriptFound:
+                transcript = transcript_list.find_generated_transcript(['en'])  # auto-gerada
+
+        transcript_data = transcript.fetch()
+        markdown = "\n".join([f"[{entry['start']:.0f}s] {entry['text']}" for entry in transcript_data])
 
         return {
-            "markdown": markdown_content,
+            "markdown": markdown or "Transcrição vazia (vídeo sem legendas).",
+            "video_id": video_id,
             "source_url": url,
-            "note": "Transcrição automática via MarkItDown (pode incluir timestamps se disponíveis)"
+            "language": transcript.language_code
         }
 
+    except (NoTranscriptFound, TranscriptsDisabled):
+        raise HTTPException(404, "Transcrição não disponível para este vídeo (sem legendas manuais ou auto-geradas).")
+    except CouldNotRetrieveTranscript as e:
+        raise HTTPException(500, f"Erro ao recuperar transcrição: {str(e)} (pode ser IP bloqueado ou vídeo restrito).")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao transcrever YouTube: {str(e)}")
+        raise HTTPException(500, f"Erro inesperado: {str(e)}")
