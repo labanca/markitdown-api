@@ -3,6 +3,8 @@ import shutil
 from uuid import uuid4
 from fastapi import FastAPI, UploadFile, HTTPException, Body
 from markitdown import MarkItDown
+from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled, CouldNotRetrieveTranscript
+from urllib.parse import urlparse, parse_qs
 
 
 app = FastAPI(title="MarkItDown API - Conversão para Markdown")
@@ -44,9 +46,8 @@ async def health_check():
     return {"status": "healthy"}
 
 
-from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled, CouldNotRetrieveTranscript
-from urllib.parse import urlparse, parse_qs
-from fastapi import Body, HTTPException
+
+
 
 def extract_video_id(url: str) -> str:
     """Extrai video_id de URL YouTube (inclui shorts, youtu.be, etc.)"""
@@ -65,37 +66,64 @@ def extract_video_id(url: str) -> str:
             return parsed.path.split('/')[2]
     raise ValueError("URL inválida do YouTube")
 
+def extract_video_id(url: str) -> str:
+    """Extrai o video_id de várias formatos de URL YouTube (inclui shorts, youtu.be, embed, etc.)"""
+    parsed = urlparse(url)
+    if parsed.hostname == 'youtu.be':
+        return parsed.path.lstrip('/')
+    if parsed.hostname in ('www.youtube.com', 'youtube.com'):
+        if parsed.path == '/watch':
+            return parse_qs(parsed.query).get('v', [None])[0]
+        if parsed.path.startswith(('/embed/', '/v/')):
+            return parsed.path.split('/')[2]
+        if parsed.path.startswith('/shorts/'):
+            return parsed.path.split('/')[2]
+    raise ValueError("Não foi possível extrair video_id da URL")
+
+
+
 @app.post("/youtube-transcription")
 async def youtube_transcription(data: dict = Body(...)):
+    """
+    Transcreve vídeo do YouTube usando youtube-transcript-api v1.2+.
+    Body: {"url": "https://www.youtube.com/watch?v=VIDEO_ID"}
+    """
     url = data.get("url")
     if not url:
-        raise HTTPException(400, "Envie 'url' no body JSON")
+        raise HTTPException(400, "Campo 'url' obrigatório no body JSON")
 
     try:
         video_id = extract_video_id(url)
-        # Tenta transcrições em pt-BR primeiro, fallback para en ou auto
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        try:
-            transcript = transcript_list.find_transcript(['pt', 'pt-BR'])
-        except NoTranscriptFound:
-            try:
-                transcript = transcript_list.find_transcript(['en'])
-            except NoTranscriptFound:
-                transcript = transcript_list.find_generated_transcript(['en'])  # auto-gerada
 
-        transcript_data = transcript.fetch()
-        markdown = "\n".join([f"[{entry['start']:.0f}s] {entry['text']}" for entry in transcript_data])
+        ytt = YouTubeTranscriptApi()  # Instancia o objeto (obrigatório na v1.2+)
+
+        # Opção 1: Fetch direto (mais simples e recomendado)
+        transcript_data = ytt.fetch(
+            video_id=video_id,
+            languages=['pt', 'pt-BR', 'en'],  # Prioridade: pt-BR > pt > en
+            preserve_formatting=False  # Mude para True se quiser tags HTML como <i>
+        )
+
+        # Converte para Markdown com timestamps
+        markdown_lines = []
+        for entry in transcript_data:
+            start = entry.get('start', 0)
+            text = entry.get('text', '').strip()
+            markdown_lines.append(f"[{int(start // 60):02d}:{int(start % 60):02d}] {text}")
+
+        markdown = "\n".join(markdown_lines) or "Transcrição vazia ou não disponível."
 
         return {
-            "markdown": markdown or "Transcrição vazia (vídeo sem legendas).",
+            "markdown": markdown,
             "video_id": video_id,
             "source_url": url,
-            "language": transcript.language_code
+            "language": "Prioridade pt-BR/en (conforme disponível)",
+            "note": "Usando youtube-transcript-api v1.2.4 – fetch direto. Funciona em vídeos com legendas manuais ou auto-geradas."
         }
 
     except (NoTranscriptFound, TranscriptsDisabled):
-        raise HTTPException(404, "Transcrição não disponível para este vídeo (sem legendas manuais ou auto-geradas).")
+        raise HTTPException(404, "Nenhuma transcrição disponível (vídeo sem legendas manuais ou automáticas).")
     except CouldNotRetrieveTranscript as e:
-        raise HTTPException(500, f"Erro ao recuperar transcrição: {str(e)} (pode ser IP bloqueado ou vídeo restrito).")
+        raise HTTPException(500, f"Erro ao recuperar transcrição: {str(e)} (pode ser bloqueio de IP, vídeo restrito ou sem legendas).")
     except Exception as e:
         raise HTTPException(500, f"Erro inesperado: {str(e)}")
