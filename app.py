@@ -5,6 +5,7 @@ from fastapi import FastAPI, UploadFile, HTTPException, Body
 from markitdown import MarkItDown
 from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled, CouldNotRetrieveTranscript
 from urllib.parse import urlparse, parse_qs
+from openai import AzureOpenAI
 
 
 app = FastAPI(title="MarkItDown API - Conversão para Markdown")
