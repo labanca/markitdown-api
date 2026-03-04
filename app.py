@@ -9,8 +9,6 @@ from urllib.parse import urlparse, parse_qs
 
 app = FastAPI(title="MarkItDown API - Conversão para Markdown")
 
-# Instancia o MarkItDown (pode receber configs via env se precisar de LLM)
-md = MarkItDown()  # Adicione parâmetros se quiser customizar (ex: llm_provider)
 
 @app.post("/convert")
 async def convert_to_markdown(file: UploadFile):
@@ -27,8 +25,22 @@ async def convert_to_markdown(file: UploadFile):
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
+        llm_client = AzureOpenAI(
+            azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT"),          
+            api_key        = os.getenv("AZURE_OPENAI_API_KEY"),
+            api_version    = os.getenv("AZURE_OPENAI_API_VERSION") 
+        )
+        
+        md = MarkItDown(
+            llm_client=llm_client, 
+            llm_model="gpt-4.1",
+            llm_prompt="do not over describe the images, only extract the data from tables present in the images and return it in a markdown table format."
+
+        )
+        
         result = md.convert(file_path)
         markdown_content = result.text_content
+
 
         return {"markdown": markdown_content}
 
