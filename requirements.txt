@@ -1,6 +1,7 @@
 fastapi==0.115.0
 uvicorn[standard]==0.32.0
 python-multipart==0.0.12
-markitdown[pptx,docx,pdf,xlsx,images,audio-transcription]==0.1.5
-youtube-transcript-api==1.2.4
-openai
+markitdown[pptx,docx,pdf,xlsx]==0.1.5
+python-pptx
+azure-ai-contentunderstanding
+azure-identity
