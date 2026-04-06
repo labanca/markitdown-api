@@ -41,6 +41,29 @@ _EXT_TO_MIME = {
 }
 
 
+def _resolve_libreoffice_bin() -> str:
+    """Resolve o executavel do LibreOffice em Linux/Windows.
+
+    Prioridade:
+    1) Variavel de ambiente LIBREOFFICE_BIN.
+    2) PATH (libreoffice, soffice, soffice.exe).
+    """
+    env_bin = os.getenv("LIBREOFFICE_BIN")
+    if env_bin:
+        return env_bin
+
+    for candidate in ("libreoffice", "soffice", "soffice.exe"):
+        path = shutil.which(candidate)
+        if path:
+            return path
+
+    raise RuntimeError(
+        "LibreOffice nao encontrado no PATH. Defina LIBREOFFICE_BIN "
+        "(ex: C:/Program Files/LibreOffice/program/soffice.exe) "
+        "ou instale/adicione o LibreOffice ao PATH."
+    )
+
+
 def convert_to_pdf(image_bytes: bytes, ext: str) -> bytes:
     """Convert a vector image (EMF, WMF, SVG) to PDF using LibreOffice headless.
 
@@ -53,9 +76,11 @@ def convert_to_pdf(image_bytes: bytes, ext: str) -> bytes:
         with open(src, "wb") as f:
             f.write(image_bytes)
 
+        libreoffice_bin = _resolve_libreoffice_bin()
+
         result = subprocess.run(
             [
-                "libreoffice", "--headless", "--norestore",
+                libreoffice_bin, "--headless", "--norestore",
                 "--convert-to", "pdf",
                 "--outdir", tmp_dir,
                 src,
@@ -78,31 +103,6 @@ def convert_to_pdf(image_bytes: bytes, ext: str) -> bytes:
 
         with open(dst, "rb") as f:
             return f.read()
-
-
-def get_base_temp_dir() -> str:
-    """Retorna um diretório temporario portavel (Windows local vs Docker).
-
-    O codigo historicamente usava '/app/temp' (Linux container). Para debug
-    local no Windows, ajustamos para um diretorio writeable.
-    """
-    env_dir = os.getenv("MARKITDOWN_TEMP_DIR")
-    if env_dir:
-        os.makedirs(env_dir, exist_ok=True)
-        return env_dir
-
-    default_dir = "/app/temp"
-    try:
-        os.makedirs(default_dir, exist_ok=True)
-        # Probe de escrita para evitar surprisas com permissao.
-        probe = os.path.join(default_dir, ".write_test")
-        with open(probe, "w", encoding="utf-8") as f:
-            f.write("1")
-        os.remove(probe)
-        return default_dir
-    except Exception:
-        # Usa o diretorio temporario do SO como fallback.
-        return os.path.join(tempfile.gettempdir(), "markitdown-api", "temp")
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +170,15 @@ def extract_tables_from_image(
     result = poller.result()
     result_dict = result.as_dict()
 
-    contents = result_dict.get("contents", [])
+    # DEBUG: log the top-level keys and first-level structure
+    print(f"[DEBUG] result_dict top-level keys: {list(result_dict.keys())}")
+    inner = result_dict.get("result", result_dict)  # handle both wrapped and unwrapped
+    print(f"[DEBUG] inner keys: {list(inner.keys())}")
+    contents = inner.get("contents", [])
+    print(f"[DEBUG] contents count: {len(contents)}")
+    if contents:
+        print(f"[DEBUG] contents[0] keys: {list(contents[0].keys())}")
+        print(f"[DEBUG] tables count: {len(contents[0].get('tables', []))}")
     if not contents:
         return None
 
@@ -339,8 +347,7 @@ async def convert_to_markdown(file: UploadFile):
         raise HTTPException(status_code=400, detail="Nenhum arquivo enviado")
 
     unique_id = uuid4().hex
-    base_temp_dir = get_base_temp_dir()
-    temp_dir = os.path.join(base_temp_dir, unique_id)
+    temp_dir = f"/app/temp/{unique_id}"
     os.makedirs(temp_dir, exist_ok=True)
     file_path = os.path.join(temp_dir, file.filename)
 
