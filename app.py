@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -29,8 +30,18 @@ from markitdown import MarkItDown
 from azure.ai.contentunderstanding import ContentUnderstandingClient
 from azure.ai.contentunderstanding.models import AnalysisInput
 from azure.core.credentials import AzureKeyCredential
+from azure.core.exceptions import HttpResponseError
 
 app = FastAPI(title="MarkItDown API - Conversão para Markdown")
+
+# ---------------------------------------------------------------------------
+# Upload size limit
+# ---------------------------------------------------------------------------
+
+# Maximum accepted upload size in bytes. Configurable via MAX_FILE_SIZE_MB env var.
+# Defaults to 100 MB. The check is done after reading the payload so oversized
+# uploads are rejected before any conversion work begins.
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE_MB", "100")) * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -223,11 +234,16 @@ def _tables_to_markdown(tables: list) -> str:
     md_tables = []
     for table in tables:
         cells = table.get("cells", [])
-        if not cells:
-            continue
-
         row_count = table.get("rowCount", 0)
         col_count = table.get("columnCount", 0)
+
+        if not cells or row_count == 0 or col_count == 0:
+            logger.warning(
+                "Skipping table with unusable structure "
+                "(cells=%d, rowCount=%d, columnCount=%d)",
+                len(cells), row_count, col_count,
+            )
+            continue
 
         # Build a 2D grid filled with empty strings
         grid = [[""] * col_count for _ in range(row_count)]
@@ -236,7 +252,12 @@ def _tables_to_markdown(tables: list) -> str:
         for cell in cells:
             r = cell.get("rowIndex", 0)
             c = cell.get("columnIndex", 0)
-            content = cell.get("content", "").replace("\n", " ").strip()
+            content = (
+                cell.get("content", "")
+                .replace("\n", " ")
+                .replace("|", "\\|")   # escape pipes to keep Markdown table valid
+                .strip()
+            )
             if r < row_count and c < col_count:
                 grid[r][c] = content
             if cell.get("kind") == "columnHeader":
@@ -317,6 +338,10 @@ def extract_tables_from_image(
 # Per-image processing: detect format, rasterize if needed, extract tables
 # ---------------------------------------------------------------------------
 
+# HTTP status codes that indicate a permanent failure — retrying will not help.
+_PERMANENT_HTTP_ERRORS = {400, 401, 403, 404}
+
+
 def process_image(
     image_bytes: bytes,
     ext: str,
@@ -325,9 +350,14 @@ def process_image(
 ) -> str | None:
     """Process a single image extracted from a PPTX slide.
 
-    - Vector formats (EMF/WMF): rasterize with LibreOffice first.
-    - Raster formats (PNG/JPG): send directly.
-    Returns extracted markdown or None if no table found.
+    - Vector formats (EMF/WMF/SVG): rasterize with LibreOffice first.
+    - Raster formats (PNG/JPG/...): send directly to Azure CU.
+
+    Retry logic:
+    - Permanent HTTP errors (400/401/403/404) abort immediately — no retry.
+    - Transient errors (5xx, timeouts, network) use exponential backoff: 1s, 2s.
+
+    Returns extracted Markdown string, or None if no table was found.
     """
     ext = ext.lower()
 
@@ -338,7 +368,7 @@ def process_image(
             logger.info("Converted to PDF: %s", image_name)
         except Exception as exc:
             logger.error("Could not rasterize %s: %s", image_name, exc)
-            return f"[Não foi possível rasterizar {image_name}: {exc}]"
+            return None  # treated as "no table" — placeholder removed cleanly
 
     mime_type = "application/pdf" if ext == "pdf" else _EXT_TO_MIME.get(ext, "image/png")
 
@@ -346,11 +376,29 @@ def process_image(
         try:
             result = extract_tables_from_image(image_bytes, mime_type, image_name)
             logger.info("%s in %s", "Tables found" if result else "No table", image_name)
-            return result  # None = no table, string = extracted markdown
+            return result
+        except HttpResponseError as exc:
+            if exc.status_code in _PERMANENT_HTTP_ERRORS:
+                logger.error(
+                    "Permanent Azure error for %s (HTTP %s) — aborting retries",
+                    image_name, exc.status_code,
+                )
+                break
+            logger.error(
+                "Transient Azure error for %s (attempt %d/%d, HTTP %s, code=%s)",
+                image_name, attempt + 1, max_retries, exc.status_code, exc.error_code,
+            )
         except Exception as exc:
-            logger.error("Content Understanding failed for %s (attempt %d): %s", image_name, attempt + 1, exc)
+            logger.error(
+                "Content Understanding failed for %s (attempt %d/%d): %s",
+                image_name, attempt + 1, max_retries, type(exc).__name__,
+            )
 
-    return f"[Não foi possível extrair dados de {image_name} após {max_retries} tentativas]"
+        if attempt < max_retries - 1:
+            time.sleep(2 ** attempt)  # backoff: 1s before attempt 2, 2s before attempt 3
+
+    logger.warning("All retries exhausted for %s — skipping image", image_name)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -457,6 +505,28 @@ async def convert_to_markdown(file: UploadFile):
     if not file.filename:
         raise HTTPException(status_code=400, detail="Nenhum arquivo enviado")
 
+    ext = file.filename.rsplit(".", 1)[-1].lower()
+
+    # Reject legacy binary PowerPoint format early with a clear message.
+    # python-pptx only supports .pptx (OOXML); .ppt requires a dedicated converter.
+    if ext == "ppt":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Formato .ppt (PowerPoint 97-2003) não é suportado. "
+                "Converta para .pptx e tente novamente."
+            ),
+        )
+
+    # Read the full payload first so we can enforce the size limit before
+    # writing anything to disk or starting any conversion work.
+    content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Arquivo muito grande. Limite: {MAX_FILE_SIZE // 1024 // 1024} MB",
+        )
+
     unique_id = uuid4().hex
     temp_dir = f"/app/temp/{unique_id}"
     os.makedirs(temp_dir, exist_ok=True)
@@ -464,11 +534,9 @@ async def convert_to_markdown(file: UploadFile):
 
     try:
         with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            buffer.write(content)
 
-        ext = file.filename.rsplit(".", 1)[-1].lower()
-
-        if ext in ("pptx", "ppt"):
+        if ext == "pptx":
             markdown_content = process_pptx(file_path)
         else:
             # All other formats: standard MarkItDown (no LLM needed for text docs)
@@ -476,8 +544,13 @@ async def convert_to_markdown(file: UploadFile):
 
         return {"markdown": markdown_content}
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro na conversão: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception:
+        # Log the full traceback internally; return a generic message to the client
+        # so stack traces, file paths and credentials are never exposed.
+        logger.exception("Conversion failed for file '%s'", file.filename)
+        raise HTTPException(status_code=500, detail="Erro interno na conversão")
 
     finally:
         if os.path.exists(temp_dir):
@@ -521,8 +594,9 @@ async def debug_to_pdf(file: UploadFile):
 
     try:
         pdf_bytes = convert_to_pdf(image_bytes, ext)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro na conversao: {str(e)}")
+    except Exception:
+        logger.exception("PDF conversion failed for '%s'", file.filename)
+        raise HTTPException(status_code=500, detail="Erro interno na conversão para PDF")
 
     filename = file.filename.rsplit(".", 1)[0] + ".pdf"
     return Response(

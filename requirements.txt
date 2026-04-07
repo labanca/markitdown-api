@@ -4,5 +4,7 @@ python-multipart==0.0.12
 markitdown[pptx,docx,pdf,xlsx]==0.1.5
 python-pptx
 azure-ai-contentunderstanding
+# azure-identity: não importado diretamente hoje, mantido para uso futuro com
+# Managed Identity / DefaultAzureCredential no lugar da API key.
 azure-identity
 python-dotenv
