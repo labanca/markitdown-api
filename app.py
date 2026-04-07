@@ -120,6 +120,92 @@ def convert_to_pdf(image_bytes: bytes, ext: str) -> bytes:
 # Table extraction via Azure Content Understanding Layout
 # ---------------------------------------------------------------------------
 
+def _parse_source_midpoint(source: str) -> tuple[float, float] | None:
+    """Extract (x_mid, y_mid) from an Azure CU source string.
+
+    Format: D(page, x1,y1, x2,y2, x3,y3, x4,y4)
+    where the four corners are topLeft, topRight, bottomRight, bottomLeft.
+    """
+    nums = [float(n) for n in re.findall(r"[\d.]+", source)]
+    if len(nums) < 9:
+        return None
+    x_mid = (nums[1] + nums[3]) / 2          # average of topLeft.x and topRight.x
+    y_mid = (nums[2] + nums[8]) / 2          # average of topLeft.y and bottomLeft.y
+    return x_mid, y_mid
+
+
+def _reconstruct_table_from_lines(lines: list) -> str | None:
+    """Reconstruct a markdown table from spatially-positioned lines.
+
+    Used as a fallback when Azure Content Understanding returns content as
+    paragraphs instead of a structured table — which happens with borderless
+    tables (no visible grid lines).
+
+    Algorithm:
+    1. Parse each line's bounding box from the 'source' coordinate string.
+    2. Cluster lines into rows by Y-midpoint proximity.
+    3. Within each row, sort lines by X-midpoint (left → right).
+    4. Use the widest row as the column reference to assign cells.
+    5. Emit a Markdown table.
+
+    Returns None if the content does not look like a multi-column table.
+    """
+    items: list[tuple[float, float, str]] = []
+    for line in lines:
+        source = line.get("source", "")
+        content = line.get("content", "").replace("\n", " ").replace("|", "\\|").strip()
+        if not source or not content:
+            continue
+        coords = _parse_source_midpoint(source)
+        if coords is None:
+            continue
+        x_mid, y_mid = coords
+        items.append((y_mid, x_mid, content))
+
+    if not items:
+        return None
+
+    items.sort(key=lambda t: (t[0], t[1]))
+
+    # Cluster into rows: lines whose Y-midpoints are within tolerance belong together
+    y_tolerance = 8.0
+    rows: list[list[tuple[float, float, str]]] = []
+    current_row: list[tuple[float, float, str]] = [items[0]]
+    for item in items[1:]:
+        if abs(item[0] - current_row[0][0]) <= y_tolerance:
+            current_row.append(item)
+        else:
+            rows.append(sorted(current_row, key=lambda t: t[1]))
+            current_row = [item]
+    rows.append(sorted(current_row, key=lambda t: t[1]))
+
+    # Only reconstruct if it looks like a table: >= 2 rows each with >= 2 items
+    if sum(1 for r in rows if len(r) >= 2) < 2:
+        return None
+
+    # Use the row with the most items as the column reference (typically the header)
+    ref_row = max(rows, key=len)
+    n_cols = len(ref_row)
+    col_centers = [item[1] for item in ref_row]
+
+    def nearest_col(x: float) -> int:
+        return min(range(n_cols), key=lambda i: abs(col_centers[i] - x))
+
+    grid_rows = []
+    for row in rows:
+        grid = [""] * n_cols
+        for _, x_mid, content in row:
+            grid[nearest_col(x_mid)] = content
+        grid_rows.append(grid)
+
+    md_lines = ["| " + " | ".join(grid_rows[0]) + " |",
+                "| " + " | ".join(["---"] * n_cols) + " |"]
+    for row in grid_rows[1:]:
+        md_lines.append("| " + " | ".join(row) + " |")
+
+    return "\n".join(md_lines)
+
+
 def _tables_to_markdown(tables: list) -> str:
     """Convert Content Understanding table objects to markdown tables.
 
@@ -189,10 +275,34 @@ def extract_tables_from_image(
     content = contents[0]
     tables = content.get("tables", [])
 
-    if not tables:
-        return None
+    if tables:
+        return _tables_to_markdown(tables)
 
-    return _tables_to_markdown(tables)
+    # Fallback: Azure CU did not detect a formal table structure.
+    # This happens with borderless tables (no visible grid lines) or tables
+    # with thin grid lines that the layout model does not detect as cells.
+    # Attempt to reconstruct the table from the spatial positions of the
+    # text elements using their bounding-box coordinates.
+    #
+    # Azure CU response structure varies by image/API version:
+    #   - Some responses expose 'lines'/'paragraphs' at contents[0] level
+    #   - Others nest them inside contents[0].pages[0]
+    # We probe both locations, preferring 'lines' (more granular) over
+    # 'paragraphs', and the page level over the content level when both exist.
+    _page0 = next(iter(content.get("pages") or []), {})
+    cu_lines = (
+        _page0.get("lines")
+        or _page0.get("paragraphs")
+        or content.get("lines")
+        or content.get("paragraphs", [])
+    )
+    if cu_lines:
+        reconstructed = _reconstruct_table_from_lines(cu_lines)
+        if reconstructed:
+            logger.info("Reconstructed borderless table from spatial lines in %s", image_name)
+            return reconstructed
+
+    return None
 
 
 # ---------------------------------------------------------------------------
