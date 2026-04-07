@@ -279,12 +279,23 @@ def extract_tables_from_image(
         return _tables_to_markdown(tables)
 
     # Fallback: Azure CU did not detect a formal table structure.
-    # This happens with borderless tables (no visible grid lines).
+    # This happens with borderless tables (no visible grid lines) or tables
+    # with thin grid lines that the layout model does not detect as cells.
     # Attempt to reconstruct the table from the spatial positions of the
     # text elements using their bounding-box coordinates.
-    # 'lines' is preferred (more granular); fall back to 'paragraphs' when
-    # the response does not include a 'lines' key (varies by image/API version).
-    cu_lines = content.get("lines") or content.get("paragraphs", [])
+    #
+    # Azure CU response structure varies by image/API version:
+    #   - Some responses expose 'lines'/'paragraphs' at contents[0] level
+    #   - Others nest them inside contents[0].pages[0]
+    # We probe both locations, preferring 'lines' (more granular) over
+    # 'paragraphs', and the page level over the content level when both exist.
+    _page0 = next(iter(content.get("pages") or []), {})
+    cu_lines = (
+        _page0.get("lines")
+        or _page0.get("paragraphs")
+        or content.get("lines")
+        or content.get("paragraphs", [])
+    )
     if cu_lines:
         reconstructed = _reconstruct_table_from_lines(cu_lines)
         if reconstructed:
