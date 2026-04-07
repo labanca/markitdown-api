@@ -11,11 +11,19 @@ from fastapi import FastAPI, UploadFile, HTTPException
 
 load_dotenv()
 
+_log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    level=_log_level,
     format="%(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Suppress verbose Azure SDK HTTP tracing unless the app itself is in DEBUG mode.
+# At INFO the SDK logs every request/response at INFO level, which is noisy in
+# normal operation. Keep them visible only when the developer explicitly asks
+# for DEBUG so they still appear during troubleshooting.
+_azure_log_level = logging.DEBUG if _log_level == "DEBUG" else logging.WARNING
+logging.getLogger("azure").setLevel(_azure_log_level)
 
 from markitdown import MarkItDown
 from azure.ai.contentunderstanding import ContentUnderstandingClient
