@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import shutil
@@ -5,7 +6,17 @@ import subprocess
 import tempfile
 from uuid import uuid4
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, HTTPException
+
+load_dotenv()
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 from markitdown import MarkItDown
 from azure.ai.contentunderstanding import ContentUnderstandingClient
 from azure.ai.contentunderstanding.models import AnalysisInput
@@ -170,15 +181,8 @@ def extract_tables_from_image(
     result = poller.result()
     result_dict = result.as_dict()
 
-    # DEBUG: log the top-level keys and first-level structure
-    print(f"[DEBUG] result_dict top-level keys: {list(result_dict.keys())}")
     inner = result_dict.get("result", result_dict)  # handle both wrapped and unwrapped
-    print(f"[DEBUG] inner keys: {list(inner.keys())}")
     contents = inner.get("contents", [])
-    print(f"[DEBUG] contents count: {len(contents)}")
-    if contents:
-        print(f"[DEBUG] contents[0] keys: {list(contents[0].keys())}")
-        print(f"[DEBUG] tables count: {len(contents[0].get('tables', []))}")
     if not contents:
         return None
 
@@ -213,9 +217,9 @@ def process_image(
         try:
             image_bytes = convert_to_pdf(image_bytes, ext)
             ext = "pdf"
-            print(f"[INFO] Converted to PDF: {image_name}")
+            logger.info("Converted to PDF: %s", image_name)
         except Exception as exc:
-            print(f"[ERROR] Could not rasterize {image_name}: {exc}")
+            logger.error("Could not rasterize %s: %s", image_name, exc)
             return f"[Não foi possível rasterizar {image_name}: {exc}]"
 
     mime_type = "application/pdf" if ext == "pdf" else _EXT_TO_MIME.get(ext, "image/png")
@@ -223,15 +227,10 @@ def process_image(
     for attempt in range(max_retries):
         try:
             result = extract_tables_from_image(image_bytes, mime_type, image_name)
-            print(
-                f"[INFO] {'Tables found' if result else 'No table'} in {image_name}"
-            )
+            logger.info("%s in %s", "Tables found" if result else "No table", image_name)
             return result  # None = no table, string = extracted markdown
         except Exception as exc:
-            print(
-                f"[ERROR] Content Understanding failed for {image_name} "
-                f"(attempt {attempt + 1}): {exc}"
-            )
+            logger.error("Content Understanding failed for %s (attempt %d): %s", image_name, attempt + 1, exc)
 
     return f"[Não foi possível extrair dados de {image_name} após {max_retries} tentativas]"
 
@@ -259,7 +258,7 @@ def _extract_slide_images(pptx_path: str) -> list[list[tuple[str, bytes, str]]]:
                         (shape.name, shape.image.blob, shape.image.ext or "png")
                     )
                 except Exception as exc:
-                    print(f"[WARN] Could not read image from shape '{shape.name}': {exc}")
+                    logger.warning("Could not read image from shape '%s': %s", shape.name, exc)
         result.append(slide_images)
     return result
 
@@ -309,12 +308,6 @@ def process_pptx(file_path: str) -> str:
         img_counter = [0]
 
         def replace_placeholder(match: re.Match) -> str:
-            alt_text = match.group(1).strip()
-
-            # MarkItDown already extracted something here — keep it
-            if alt_text:
-                return match.group(0)
-
             pos = img_counter[0]
             img_counter[0] += 1
 
@@ -323,7 +316,7 @@ def process_pptx(file_path: str) -> str:
 
             shape_name, img_bytes, ext = images_for_slide[pos]
             label = f"slide{slide_idx + 1}_{shape_name}.{ext}"
-            print(f"[INFO] Processing image: {label}")
+            logger.info("Processing image: %s", label)
 
             extracted = process_image(img_bytes, ext, label)
 
